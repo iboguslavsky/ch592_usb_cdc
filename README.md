@@ -31,16 +31,15 @@ that expose only USB D+/D- and BOOT, no UART pins.
    Disable stdio buffering for interactive use:
    `setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stdin, NULL, _IONBF, 0);`
 
-Example `Makefile` fragment (see `../ch592_usb_cdc` for a full example):
+Example `Makefile` fragment (this repo's own `Makefile` is the reference):
 
 ```make
-LIBUSBCDC_DIR = ../ch592_usbcdc
-INCLUDES += -I$(LIBUSBCDC_DIR)/USB/include
-
-$(BUILD_DIR)/usb_cdc.o: $(LIBUSBCDC_DIR)/USB/usb_cdc.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+SRCS_C = APP/cdc_main.c USB/usb_cdc.c ...
+INCLUDES = -IUSB/include ...
 ```
+
+The stock pattern rule `$(BUILD_DIR)/%.o: %.c` handles the `USB/`
+subdirectory with no special cases.
 
 ## API
 
@@ -70,3 +69,29 @@ unique MAC (`CH592-AABBCCDDEEFF`).
 
 Linux `/dev/ttyACM*`, macOS `/dev/cu.usbmodem*`, Windows `usbser.sys`
 — no custom drivers. 115200 8N1 works; baud is virtual (ignored by HW).
+
+---
+
+## Reference example: interactive debug console (`APP/cdc_main.c`)
+
+The other half of this repo. A thin shell demonstrating the library:
+banner with chip info/MAC/baud, `help`, `info`, `scanf` test, `boot`
+(PB22 state + press counter), `bench` (100-line throughput), `echo`,
+`reboot` — plus an async `[EVENT]` line whenever the BOOT button is
+pressed while the console is open.
+
+### Build & flash
+
+```bash
+make          # -> build/ch592_usb_cdc.bin
+./flash.sh    # bridge BOOT(PB22) to GND while plugging in USB
+```
+
+### Open the console
+
+```bash
+picocom -b 115200 /dev/ttyACM0   # or tio / minicom
+```
+
+Baud is virtual (ignored by hardware); DTR open/close is visible to
+firmware via `usb_cdc_is_connected()`.
