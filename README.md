@@ -54,9 +54,23 @@ subdirectory with no special cases.
 | `usb_cdc_flush()` | block until TX drained (with timeout, never hangs) |
 | `usb_cdc_readline()` | interactive line input (echo + backspace) |
 | `usb_cdc_set_echo/line_mode()` | input modes for `_read`/`scanf` |
+| `usb_cdc_enter_bootloader()` | programmatically jump to WCH USB ISP bootloader |
+| `usb_cdc_enable_1200bps_bootloader()` | toggle automatic 1200-baud touch (default: on) |
 
 `printf()` never blocks forever: TX has a 50 ms timeout and the host is
 NAKed when the RX ring is full, resuming automatically on read.
+
+## Buttonless Bootloader Entry (1200-Baud Touch & Programmatic)
+
+No physical button or pin bridging required after initial flashing:
+
+- **1200-baud touch (Arduino style)**: Opening the CDC port at 1200 baud
+  signals the firmware to erase sector 0, write `R16_INT32K_TUNE = 0xFFFF`,
+  and perform a software reset into the WCH ROM ISP bootloader (`4348:55e0`).
+- **Programmatic API**: Call `usb_cdc_enter_bootloader()` from any command
+  line, button handler, or telemetry packet.
+- **Automated `./flash.sh`**: Automatically detects the active CDC port,
+  reboots into ISP mode buttonlessly, and flashes via `wchisp`.
 
 ## Tuning
 

@@ -224,6 +224,8 @@ static volatile uint8_t  s_usb_dtr        = 0;
 static volatile uint8_t  s_usb_rts        = 0;
 static volatile uint8_t  s_tx_busy        = 0;
 static volatile uint8_t  s_rx_paused      = 0;
+static volatile uint8_t  s_1200bps_enabled = 1;
+static volatile uint8_t  s_1200bps_pending = 0;
 
 static volatile uint8_t  s_dev_addr       = 0;
 static volatile uint8_t  s_setup_req      = 0xFF;
@@ -390,6 +392,12 @@ void USB_IRQHandler(void)
                     {
                         R8_UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
                         s_setup_req = 0xFF;
+                        if (s_1200bps_pending)
+                        {
+                            s_1200bps_pending = 0;
+                            mDelaymS(10);
+                            usb_cdc_enter_bootloader();
+                        }
                     }
                     break;
                 }
@@ -404,6 +412,10 @@ void USB_IRQHandler(void)
                         if (R8_USB_RX_LEN >= sizeof(cdc_line_coding_t))
                         {
                             memcpy(&g_line_coding, Ep0Buffer, sizeof(cdc_line_coding_t));
+                            if (s_1200bps_enabled && g_line_coding.baud_rate == 1200)
+                            {
+                                s_1200bps_pending = 1;
+                            }
                         }
                         /* Send 0-length status packet on IN */
                         R8_UEP0_T_LEN = 0;
@@ -1000,3 +1012,46 @@ int _lseek(int fd, int ptr, int dir)
     (void)dir;
     return 0;
 }
+
+/* ===================================================================
+ * Buttonless Bootloader Entry
+ * =================================================================== */
+
+void usb_cdc_enable_1200bps_bootloader(uint8_t enable)
+{
+    s_1200bps_enabled = enable ? 1 : 0;
+}
+
+/* Must execute from RAM. Erases application flash at 0x0000 to force ROM bootloader into ISP mode! */
+__HIGH_CODE
+void usb_cdc_enter_bootloader(void)
+{
+    PFIC_DisableAllIRQ();
+
+    /* Erase flash sector 0 (4096 bytes). Unlock and retry if protected. */
+    if (FLASH_ROM_ERASE(0, 4096) != 0) {
+        FLASH_EEPROM_CMD(CMD_FLASH_ROM_LOCK, 0, NULL, 0);
+        if (FLASH_ROM_ERASE(0, 4096) != 0) {
+            while (1) {}  /* Erase failed */
+        }
+    }
+
+    FLASH_ROM_SW_RESET();
+
+    sys_safe_access_enable();
+    R16_INT32K_TUNE = 0xFFFF;
+    sys_safe_access_disable();
+
+    sys_safe_access_enable();
+    R8_RST_WDOG_CTRL |= RB_SOFTWARE_RESET;
+    sys_safe_access_disable();
+
+    while (1) {}
+}
+
+__HIGH_CODE
+void enter_isp_bootloader(void)
+{
+    usb_cdc_enter_bootloader();
+}
+

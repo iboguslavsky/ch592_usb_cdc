@@ -48,6 +48,7 @@ static void cmd_help(void)
     printf("  bench          - Benchmark USB CDC transmission speed\r\n");
     printf("  echo <text>    - Echo input back to console\r\n");
     printf("  reboot         - Software reset MCU\r\n");
+    printf("  isp            - Erase sector 0 & enter ISP bootloader\r\n");
 }
 
 /* Show hardware info */
@@ -175,6 +176,12 @@ int main(void)
             usb_cdc_flush();
             mDelaymS(50);
             SYS_ResetExecute();
+        }
+        else if (strcmp(line, "isp") == 0 || strcmp(line, "bootloader") == 0) {
+            printf("Erasing sector 0 and rebooting into ISP bootloader...\r\n");
+            usb_cdc_flush();
+            mDelaymS(50);
+            enter_isp_bootloader();
         }
         else {
             printf("Unknown command: '%s'. Type 'help' for commands.\r\n", line);

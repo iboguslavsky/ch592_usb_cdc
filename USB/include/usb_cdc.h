@@ -102,6 +102,34 @@ void usb_cdc_set_line_mode(uint8_t enable);
  */
 int usb_cdc_readline(char *buf, int max_len);
 
+/**
+ * @brief Reboot MCU into WCH USB ISP bootloader mode without pressing the physical BOOT button.
+ *        Executes from RAM (__HIGH_CODE).
+ *        1. Disables all interrupts (PFIC_DisableAllIRQ).
+ *        2. Erases application flash at 0x0000 (sector 0, 4096 bytes).
+ *        3. Resets flash controller (FLASH_ROM_SW_RESET).
+ *        4. Writes 0xFFFF magic signature to R16_INT32K_TUNE.
+ *        5. Triggers a full software reset (RB_SOFTWARE_RESET).
+ *
+ *        Upon reboot, the factory ROM bootloader detects erased sector 0 and the 0xFFFF token,
+ *        remaining indefinitely in USB ISP bootloader mode (VID:PID 4348:55e0 / 1a86:55e0)
+ *        until new firmware is flashed via wchisp.
+ */
+void usb_cdc_enter_bootloader(void);
+
+/**
+ * @brief Backward-compatibility alias for usb_cdc_enter_bootloader().
+ */
+void enter_isp_bootloader(void);
+
+/**
+ * @brief Enable or disable automatic bootloader entry on 1200 bps baud touch.
+ *        When enabled (default: 1), opening the CDC COM port at 1200 baud
+ *        automatically triggers usb_cdc_enter_bootloader().
+ * @param enable 1 to enable (default), 0 to disable.
+ */
+void usb_cdc_enable_1200bps_bootloader(uint8_t enable);
+
 #ifdef __cplusplus
 }
 #endif
