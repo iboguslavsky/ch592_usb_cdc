@@ -3,10 +3,40 @@ set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 BIN="$DIR/build/ch592_usb_cdc.bin"
 [ -f "$BIN" ] || { echo "Building first..."; make -C "$DIR"; }
+
 # Check if WCH ISP device is already present in USB topology (WITHOUT claiming the USB interface)
 if ! lsusb 2>/dev/null | grep -q -E "4348:55e0|1a86:55e0"; then
-    # Look for active CH592 USB CDC device
-    CDC_PORT=$(ls /dev/serial/by-id/*CH592* 2>/dev/null | head -n 1 || true)
+    CDC_PORT=""
+    if [ -n "$1" ]; then
+        if [ -e "$1" ]; then
+            CDC_PORT="$1"
+        else
+            CDC_PORT=$(ls /dev/serial/by-id/*"$1"* 2>/dev/null | head -n 1 || true)
+        fi
+        if [ -z "$CDC_PORT" ] || [ ! -e "$CDC_PORT" ]; then
+            echo "Error: Specified device '$1' not found."
+            exit 1
+        fi
+    else
+        mapfile -t PORTS < <(ls /dev/serial/by-id/*CH592* 2>/dev/null || true)
+        if [ "${#PORTS[@]}" -eq 1 ]; then
+            CDC_PORT="${PORTS[0]}"
+        elif [ "${#PORTS[@]}" -gt 1 ]; then
+            echo "Multiple CH592 CDC devices found:"
+            for i in "${!PORTS[@]}"; do
+                TTY=$(readlink -f "${PORTS[$i]}")
+                ID=$(basename "${PORTS[$i]}")
+                echo "  [$((i + 1))] $TTY  ($ID)"
+            done
+            read -r -p "Select device to flash [1-${#PORTS[@]}]: " choice
+            if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#PORTS[@]}" ]; then
+                echo "Invalid selection. Aborting."
+                exit 1
+            fi
+            CDC_PORT="${PORTS[$((choice - 1))]}"
+        fi
+    fi
+
     if [ -n "$CDC_PORT" ] && [ -e "$CDC_PORT" ]; then
         echo "Found active CH592 CDC console at $CDC_PORT. Requesting buttonless ISP reboot..."
         python3 -c "
