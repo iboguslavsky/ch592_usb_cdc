@@ -27,6 +27,15 @@ uint8_t usb_cdc_is_configured(void);
 uint8_t usb_cdc_is_connected(void);
 
 /**
+ * @brief Check if MCU should stay awake (inhibit deep sleep) to service USB.
+ *        Returns 1 during the initial boot/reset enumeration grace window (3s),
+ *        for 3s after any USB bus reset or setup transfer, and continuously
+ *        while enumerated by a USB host (until USB bus suspend/unplug).
+ *        Returns 0 when running on battery with no active USB host.
+ */
+uint8_t usb_cdc_keep_awake(void);
+
+/**
  * @brief Get current baud rate requested by host via SET_LINE_CODING.
  * @return Baud rate (e.g. 115200).
  */

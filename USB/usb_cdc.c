@@ -8,7 +8,6 @@
 #include "CH59x_common.h"
 #include "CH59x_sys.h"
 #include "CH59x_gpio.h"
-#include "ISP592.h"
 #include "usb_cdc.h"
 #include <string.h>
 #include <stdio.h>
@@ -227,6 +226,13 @@ static volatile uint8_t  s_rx_paused      = 0;
 static volatile uint8_t  s_1200bps_enabled = 1;
 static volatile uint8_t  s_1200bps_pending = 0;
 
+/* Keep-awake grace window (3 seconds = 98304 RTC @ 32.768kHz ticks) so low-power
+ * BLE/TMOS apps do not enter deep sleep before USB host enumeration completes */
+#define USB_ENUM_GRACE_RTC_TICKS  (3UL * 32768UL)
+static volatile uint8_t  s_usb_grace_active      = 1;
+static volatile uint8_t  s_usb_grace_rtc_latched = 0;
+static volatile uint32_t s_usb_grace_start_rtc   = 0;
+
 static volatile uint8_t  s_dev_addr       = 0;
 static volatile uint8_t  s_setup_req      = 0xFF;
 static volatile uint16_t s_setup_len      = 0;
@@ -281,8 +287,13 @@ void usb_cdc_init(void)
     s_rx_paused = 0;
     s_line_head = 0;
     s_line_tail = 0;
+    s_usb_grace_active = 1;
+    s_usb_grace_rtc_latched = 0;
 
     init_serial_string();
+
+    /* Ensure USB pins PB10 (UD-) and PB11 (UD+) are floating inputs (no GPIO pull-down/up) */
+    GPIOB_ModeCfg(GPIO_Pin_10 | GPIO_Pin_11, GPIO_ModeIN_Floating);
 
     /* Force USB bus disconnect by disabling pull-up, allowing host to detect reset */
     R8_UDEV_CTRL = 0;
@@ -343,6 +354,26 @@ uint8_t usb_cdc_is_connected(void)
     return (s_usb_configured && s_usb_dtr);
 }
 
+uint8_t usb_cdc_keep_awake(void)
+{
+    if (s_usb_configured) {
+        return 1;
+    }
+    if (s_usb_grace_active) {
+        uint32_t now = R32_RTC_CNT_32K;
+        if (!s_usb_grace_rtc_latched) {
+            s_usb_grace_start_rtc = now;
+            s_usb_grace_rtc_latched = 1;
+            return 1;
+        }
+        if ((uint32_t)(now - s_usb_grace_start_rtc) < USB_ENUM_GRACE_RTC_TICKS) {
+            return 1;
+        }
+        s_usb_grace_active = 0;
+    }
+    return 0;
+}
+
 uint32_t usb_cdc_get_baud_rate(void)
 {
     return g_line_coding.baud_rate;
@@ -359,6 +390,9 @@ void USB_IRQHandler(void)
 
     if (int_fg & RB_UIF_TRANSFER)
     {
+        s_usb_grace_active = 1;
+        s_usb_grace_start_rtc = R32_RTC_CNT_32K;
+        s_usb_grace_rtc_latched = 1;
         uint8_t int_st = R8_USB_INT_ST;
 
         /* Non-SETUP transfers: IN or OUT token */
@@ -693,13 +727,16 @@ void USB_IRQHandler(void)
     }
     else if (int_fg & RB_UIF_BUS_RST)
     {
-        /* USB Bus Reset from host */
+        /* USB Bus Reset from host: stay awake for enumeration */
         R8_USB_DEV_AD = 0x00;
         s_usb_configured = 0;
         s_usb_dtr = 0;
         s_usb_rts = 0;
         s_tx_busy = 0;
         s_rx_paused = 0;
+        s_usb_grace_active = 1;
+        s_usb_grace_start_rtc = R32_RTC_CNT_32K;
+        s_usb_grace_rtc_latched = 1;
 
         R8_UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
         R8_UEP1_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK | RB_UEP_AUTO_TOG;
@@ -709,6 +746,20 @@ void USB_IRQHandler(void)
     }
     else if (int_fg & RB_UIF_SUSPEND)
     {
+        if (R8_USB_MIS_ST & RB_UMS_SUSPEND)
+        {
+            /* Host suspended or USB cable unplugged */
+            s_usb_configured = 0;
+            s_usb_dtr = 0;
+            s_usb_rts = 0;
+        }
+        else
+        {
+            /* Bus woke from suspend (e.g. USB cable plugged in): hold off sleep for enumeration */
+            s_usb_grace_active = 1;
+            s_usb_grace_start_rtc = R32_RTC_CNT_32K;
+            s_usb_grace_rtc_latched = 1;
+        }
         R8_USB_INT_FG = RB_UIF_SUSPEND;
     }
     else
