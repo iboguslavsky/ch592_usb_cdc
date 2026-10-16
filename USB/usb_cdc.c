@@ -277,12 +277,14 @@ static void usb_cdc_disable_hw(void)
 {
     PFIC_DisableIRQ(USB_IRQn);
     R8_USB_INT_EN = 0;
-    R8_UDEV_CTRL = 0;
+    /* IMPORTANT: RB_UD_PD_DIS (bit 7, reset value 1) MUST remain 1 to disable the internal
+     * 15k USB pull-downs! Setting R8_UDEV_CTRL = 0 enables internal 15k pull-downs on UD+/UD-. */
+    R8_UDEV_CTRL = RB_UD_PD_DIS;
     R8_USB_CTRL = RB_UC_RESET_SIE | RB_UC_CLR_ALL;
     R8_USB_CTRL = 0;
     R16_PIN_ANALOG_IE &= ~(RB_PIN_USB_IE | RB_PIN_USB_DP_PU);
     R8_USB_INT_FG = 0xFF;
-    /* Park USB D-/D+ (PB10/PB11) with pull-downs to prevent CMOS floating leakage (~4uA sleep) */
+    /* Park USB D-/D+ (PB10/PB11) with 50k GPIO pull-downs to prevent CMOS floating leakage (~4uA sleep) */
     GPIOB_ModeCfg(GPIO_Pin_10 | GPIO_Pin_11, GPIO_ModeIN_PD);
     s_usb_hw_enabled = 0;
     s_usb_configured = 0;
@@ -291,12 +293,14 @@ static void usb_cdc_disable_hw(void)
     s_usb_grace_active = 0;
 }
 
-/* Probe whether a USB host (15k pull-downs on both D+ and D-) is physically connected.
- * Uses the CH592 internal 50k GPIO pull-ups on PB10 (UD-) and PB11 (UD+):
- * - Unplugged (open circuit): 50k pull-up brings both pins HIGH (3.3V -> reads non-zero).
+/* Probe whether an external USB host (15k pull-downs on both D+ and D-) is physically connected.
+ * Uses the CH592 internal 50k GPIO pull-ups on PB10 (UD-) and PB11 (UD+) with internal USB pull-downs disabled:
+ * - Unplugged (open circuit): 50k GPIO pull-up brings both pins HIGH (3.3V -> reads non-zero).
  * - Host connected (15k pull-down): 15k/(50k+15k) divider holds both pins LOW (0.76V -> reads 0). */
 static uint8_t usb_cdc_detect_host(void)
 {
+    R8_UDEV_CTRL = RB_UD_PD_DIS;
+    R16_PIN_ANALOG_IE &= ~(RB_PIN_USB_IE | RB_PIN_USB_DP_PU);
     GPIOB_ModeCfg(GPIO_Pin_10 | GPIO_Pin_11, GPIO_ModeIN_PU);
     DelayUs(25);
     uint32_t pins = GPIOB_ReadPortPin(GPIO_Pin_10 | GPIO_Pin_11);
@@ -334,7 +338,7 @@ void usb_cdc_init(void)
     GPIOB_ModeCfg(GPIO_Pin_11, GPIO_ModeIN_Floating);
 
     /* Force USB bus disconnect by disabling pull-up, allowing host to detect reset */
-    R8_UDEV_CTRL = 0;
+    R8_UDEV_CTRL = RB_UD_PD_DIS;
     R8_USB_CTRL = 0;
     R16_PIN_ANALOG_IE &= ~(RB_PIN_USB_IE | RB_PIN_USB_DP_PU);
     mDelaymS(30);
@@ -394,10 +398,13 @@ uint8_t usb_cdc_is_connected(void)
 
 uint8_t usb_cdc_keep_awake(void)
 {
+    static uint32_t s_last_detect_rtc = 0;
+
     if (s_usb_configured) {
         if (R8_USB_MIS_ST & RB_UMS_SUSPEND) {
             /* USB host suspended or cable unplugged: shut down USB PHY for 4uA sleep */
             usb_cdc_disable_hw();
+            s_last_detect_rtc = RTC_GetCycle32k();
             return 0;
         }
         return 1;
@@ -417,15 +424,23 @@ uint8_t usb_cdc_keep_awake(void)
         }
         /* Grace window expired with no USB host configuration: shut down USB PHY for 4uA sleep */
         usb_cdc_disable_hw();
+        s_last_detect_rtc = now;
         return 0;
     }
     if (!s_usb_hw_enabled) {
-        /* Passive 25us check if USB host was hot-plugged while running on battery */
-        if (usb_cdc_detect_host()) {
-            usb_cdc_init();
-            s_usb_grace_start_rtc = RTC_GetCycle32k();
-            s_usb_grace_rtc_latched = 1;
-            return 1;
+        /* Passive 25us check (at most once every 250ms) if USB host was hot-plugged while on battery */
+        uint32_t now = RTC_GetCycle32k();
+        uint32_t since_detect = (now >= s_last_detect_rtc)
+                              ? (now - s_last_detect_rtc)
+                              : (now + (0xA8C00000UL - s_last_detect_rtc));
+        if (since_detect >= 8192UL) {
+            s_last_detect_rtc = now;
+            if (usb_cdc_detect_host()) {
+                usb_cdc_init();
+                s_usb_grace_start_rtc = RTC_GetCycle32k();
+                s_usb_grace_rtc_latched = 1;
+                return 1;
+            }
         }
     } else {
         usb_cdc_disable_hw();
