@@ -226,9 +226,10 @@ static volatile uint8_t  s_rx_paused      = 0;
 static volatile uint8_t  s_1200bps_enabled = 1;
 static volatile uint8_t  s_1200bps_pending = 0;
 
-/* Keep-awake grace window (3 seconds = 98304 RTC @ 32.768kHz ticks) so low-power
+/* Keep-awake grace window (1.5 seconds = 49152 RTC @ 32.768kHz ticks) so low-power
  * BLE/TMOS apps do not enter deep sleep before USB host enumeration completes */
-#define USB_ENUM_GRACE_RTC_TICKS  (3UL * 32768UL)
+#define USB_ENUM_GRACE_RTC_TICKS  (49152UL)
+static volatile uint8_t  s_usb_hw_enabled        = 0;
 static volatile uint8_t  s_usb_grace_active      = 1;
 static volatile uint8_t  s_usb_grace_rtc_latched = 0;
 static volatile uint32_t s_usb_grace_start_rtc   = 0;
@@ -270,6 +271,40 @@ static void init_serial_string(void)
 }
 
 /* ===================================================================
+ * Low-Power USB PHY Shutdown & Passive Host Detection
+ * =================================================================== */
+static void usb_cdc_disable_hw(void)
+{
+    PFIC_DisableIRQ(USB_IRQn);
+    R8_USB_INT_EN = 0;
+    R8_UDEV_CTRL = 0;
+    R8_USB_CTRL = RB_UC_RESET_SIE | RB_UC_CLR_ALL;
+    R8_USB_CTRL = 0;
+    R16_PIN_ANALOG_IE &= ~(RB_PIN_USB_IE | RB_PIN_USB_DP_PU);
+    R8_USB_INT_FG = 0xFF;
+    /* Park USB D-/D+ (PB10/PB11) with pull-downs to prevent CMOS floating leakage (~4uA sleep) */
+    GPIOB_ModeCfg(GPIO_Pin_10 | GPIO_Pin_11, GPIO_ModeIN_PD);
+    s_usb_hw_enabled = 0;
+    s_usb_configured = 0;
+    s_usb_dtr = 0;
+    s_usb_rts = 0;
+    s_usb_grace_active = 0;
+}
+
+/* Probe whether a USB host (15k pull-downs on both D+ and D-) is physically connected.
+ * Uses the CH592 internal 50k GPIO pull-ups on PB10 (UD-) and PB11 (UD+):
+ * - Unplugged (open circuit): 50k pull-up brings both pins HIGH (3.3V -> reads non-zero).
+ * - Host connected (15k pull-down): 15k/(50k+15k) divider holds both pins LOW (0.76V -> reads 0). */
+static uint8_t usb_cdc_detect_host(void)
+{
+    GPIOB_ModeCfg(GPIO_Pin_10 | GPIO_Pin_11, GPIO_ModeIN_PU);
+    DelayUs(25);
+    uint32_t pins = GPIOB_ReadPortPin(GPIO_Pin_10 | GPIO_Pin_11);
+    GPIOB_ModeCfg(GPIO_Pin_10 | GPIO_Pin_11, GPIO_ModeIN_PD);
+    return (pins == 0) ? 1 : 0;
+}
+
+/* ===================================================================
  * USB CDC Hardware Initialization
  * =================================================================== */
 void usb_cdc_init(void)
@@ -287,13 +322,16 @@ void usb_cdc_init(void)
     s_rx_paused = 0;
     s_line_head = 0;
     s_line_tail = 0;
+    s_usb_hw_enabled = 1;
     s_usb_grace_active = 1;
     s_usb_grace_rtc_latched = 0;
 
     init_serial_string();
 
-    /* Ensure USB pins PB10 (UD-) and PB11 (UD+) are floating inputs (no GPIO pull-down/up) */
-    GPIOB_ModeCfg(GPIO_Pin_10 | GPIO_Pin_11, GPIO_ModeIN_Floating);
+    /* Keep weak pull-down on PB10 (UD-) so unplugging the cable cleanly enters J-state (idle/suspend)
+     * instead of floating; keep PB11 (UD+) floating so the 1.5k USB pull-up pulls it cleanly to 3.3V */
+    GPIOB_ModeCfg(GPIO_Pin_10, GPIO_ModeIN_PD);
+    GPIOB_ModeCfg(GPIO_Pin_11, GPIO_ModeIN_Floating);
 
     /* Force USB bus disconnect by disabling pull-up, allowing host to detect reset */
     R8_UDEV_CTRL = 0;
@@ -357,19 +395,40 @@ uint8_t usb_cdc_is_connected(void)
 uint8_t usb_cdc_keep_awake(void)
 {
     if (s_usb_configured) {
+        if (R8_USB_MIS_ST & RB_UMS_SUSPEND) {
+            /* USB host suspended or cable unplugged: shut down USB PHY for 4uA sleep */
+            usb_cdc_disable_hw();
+            return 0;
+        }
         return 1;
     }
     if (s_usb_grace_active) {
-        uint32_t now = R32_RTC_CNT_32K;
+        uint32_t now = RTC_GetCycle32k();
         if (!s_usb_grace_rtc_latched) {
             s_usb_grace_start_rtc = now;
             s_usb_grace_rtc_latched = 1;
             return 1;
         }
-        if ((uint32_t)(now - s_usb_grace_start_rtc) < USB_ENUM_GRACE_RTC_TICKS) {
+        uint32_t elapsed = (now >= s_usb_grace_start_rtc)
+                         ? (now - s_usb_grace_start_rtc)
+                         : (now + (0xA8C00000UL - s_usb_grace_start_rtc));
+        if (elapsed < USB_ENUM_GRACE_RTC_TICKS) {
             return 1;
         }
-        s_usb_grace_active = 0;
+        /* Grace window expired with no USB host configuration: shut down USB PHY for 4uA sleep */
+        usb_cdc_disable_hw();
+        return 0;
+    }
+    if (!s_usb_hw_enabled) {
+        /* Passive 25us check if USB host was hot-plugged while running on battery */
+        if (usb_cdc_detect_host()) {
+            usb_cdc_init();
+            s_usb_grace_start_rtc = RTC_GetCycle32k();
+            s_usb_grace_rtc_latched = 1;
+            return 1;
+        }
+    } else {
+        usb_cdc_disable_hw();
     }
     return 0;
 }
@@ -391,7 +450,7 @@ void USB_IRQHandler(void)
     if (int_fg & RB_UIF_TRANSFER)
     {
         s_usb_grace_active = 1;
-        s_usb_grace_start_rtc = R32_RTC_CNT_32K;
+        s_usb_grace_start_rtc = RTC_GetCycle32k();
         s_usb_grace_rtc_latched = 1;
         uint8_t int_st = R8_USB_INT_ST;
 
@@ -735,7 +794,7 @@ void USB_IRQHandler(void)
         s_tx_busy = 0;
         s_rx_paused = 0;
         s_usb_grace_active = 1;
-        s_usb_grace_start_rtc = R32_RTC_CNT_32K;
+        s_usb_grace_start_rtc = RTC_GetCycle32k();
         s_usb_grace_rtc_latched = 1;
 
         R8_UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
@@ -749,16 +808,12 @@ void USB_IRQHandler(void)
         if (R8_USB_MIS_ST & RB_UMS_SUSPEND)
         {
             /* Host suspended or USB cable unplugged */
-            s_usb_configured = 0;
-            s_usb_dtr = 0;
-            s_usb_rts = 0;
-        }
-        else
-        {
-            /* Bus woke from suspend (e.g. USB cable plugged in): hold off sleep for enumeration */
-            s_usb_grace_active = 1;
-            s_usb_grace_start_rtc = R32_RTC_CNT_32K;
-            s_usb_grace_rtc_latched = 1;
+            if (s_usb_configured) {
+                s_usb_configured = 0;
+                s_usb_dtr = 0;
+                s_usb_rts = 0;
+                s_usb_grace_active = 0;
+            }
         }
         R8_USB_INT_FG = RB_UIF_SUSPEND;
     }
