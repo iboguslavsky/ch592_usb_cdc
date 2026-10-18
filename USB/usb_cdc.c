@@ -23,7 +23,7 @@
 #define CDC_RX_BUF_SIZE         256     /* Must be power of 2 */
 #define CDC_LINE_BUF_SIZE       128
 
-#define TX_TIMEOUT_US           50000   /* 50ms timeout for non-blocking flush */
+#define TX_TIMEOUT_US           2000    /* 2ms timeout (2 USB frames) before marking TX host stalled */
 
 /* ===================================================================
  * USB Hardware DMA Buffers (must be 4-byte aligned)
@@ -222,6 +222,7 @@ static volatile uint8_t  s_usb_configured = 0;
 static volatile uint8_t  s_usb_dtr        = 0;
 static volatile uint8_t  s_usb_rts        = 0;
 static volatile uint8_t  s_tx_busy        = 0;
+static volatile uint8_t  s_tx_stalled     = 0;
 static volatile uint8_t  s_rx_paused      = 0;
 static volatile uint8_t  s_1200bps_enabled = 1;
 static volatile uint8_t  s_1200bps_pending = 0;
@@ -290,6 +291,8 @@ static void usb_cdc_disable_hw(void)
     s_usb_configured = 0;
     s_usb_dtr = 0;
     s_usb_rts = 0;
+    s_tx_busy = 0;
+    s_tx_stalled = 0;
     s_usb_grace_active = 0;
 }
 
@@ -323,6 +326,7 @@ void usb_cdc_init(void)
     s_usb_dtr = 0;
     s_usb_rts = 0;
     s_tx_busy = 0;
+    s_tx_stalled = 0;
     s_rx_paused = 0;
     s_line_head = 0;
     s_line_tail = 0;
@@ -575,6 +579,7 @@ void USB_IRQHandler(void)
                  * --------------------------------------------------- */
                 case UIS_TOKEN_IN | 1:
                 {
+                    s_tx_stalled = 0;
                     uint16_t pending = tx_ring_count();
                     if (pending > 0)
                     {
@@ -696,6 +701,7 @@ void USB_IRQHandler(void)
                     case 0x09: /* SET_CONFIGURATION */
                     {
                         s_usb_configured = (uint8_t)(val & 0xFF) ? 1 : 0;
+                        s_tx_stalled = 0;
                         if (s_usb_configured)
                         {
                             R8_UEP1_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK | RB_UEP_AUTO_TOG;
@@ -768,6 +774,7 @@ void USB_IRQHandler(void)
                     case 0x22: /* SET_CONTROL_LINE_STATE */
                         s_usb_dtr = (val & 0x01) ? 1 : 0;
                         s_usb_rts = (val & 0x02) ? 1 : 0;
+                        s_tx_stalled = 0;
                         tx_len = 0;
                         break;
 
@@ -807,6 +814,7 @@ void USB_IRQHandler(void)
         s_usb_dtr = 0;
         s_usb_rts = 0;
         s_tx_busy = 0;
+        s_tx_stalled = 0;
         s_rx_paused = 0;
         s_usb_grace_active = 1;
         s_usb_grace_start_rtc = RTC_GetCycle32k();
@@ -887,9 +895,22 @@ int usb_cdc_write(const void *buf, int len)
                 written += chunk;
                 PFIC_EnableIRQ(USB_IRQn);
             }
+            else if (s_tx_stalled)
+            {
+                /* Host is not actively draining EP1 IN (no terminal open):
+                 * overwrite oldest bytes in ring buffer with zero blocking */
+                int chunk = len - written;
+                for (int i = 0; i < chunk; i++) {
+                    s_tx_ring.buffer[s_tx_ring.head] = data[written + i];
+                    s_tx_ring.head = (s_tx_ring.head + 1) & (CDC_TX_BUF_SIZE - 1);
+                    s_tx_ring.tail = (s_tx_ring.tail + 1) & (CDC_TX_BUF_SIZE - 1);
+                }
+                written += chunk;
+                PFIC_EnableIRQ(USB_IRQn);
+            }
             else
             {
-                /* Ring buffer full: wait for interrupt to transmit */
+                /* Ring buffer full: wait up to 2ms for host to poll EP1 IN */
                 PFIC_EnableIRQ(USB_IRQn);
 
                 uint32_t wait_us = 0;
@@ -899,7 +920,8 @@ int usb_cdc_write(const void *buf, int len)
                     wait_us += 10;
                     if (wait_us >= TX_TIMEOUT_US || !s_usb_configured)
                     {
-                        /* Host stopped polling; discard remainder to avoid hanging */
+                        /* Host stopped polling (no terminal open); mark stalled for zero-wait drops */
+                        s_tx_stalled = 1;
                         return len;
                     }
                 }
